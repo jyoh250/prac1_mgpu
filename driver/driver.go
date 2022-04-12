@@ -3,6 +3,7 @@ package driver
 import (
 	"log"
 	"reflect"
+	"runtime/debug"
 	"sync"
 
 	"github.com/rs/xid"
@@ -116,6 +117,7 @@ func (d *Driver) runEngine() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Panic: %v", r)
+			debug.PrintStack()
 			atexit.Exit(1)
 		}
 	}()
@@ -299,10 +301,14 @@ func (d *Driver) logCmdStart(cmd Command, now sim.VTimeInSec) {
 		reflect.TypeOf(cmd).String(),
 		nil,
 	)
+	// log.Printf("%.10f, %s, cmd start, %s\n",
+	// 	now, d.Name(), reflect.TypeOf(cmd))
 }
 
 func (d *Driver) logCmdComplete(cmd Command, now sim.VTimeInSec) {
 	tracing.EndTask(cmd.GetID(), now, d)
+	// log.Printf("%.10f, %s, cmd end, %s\n",
+	// 	now, d.Name(), reflect.TypeOf(cmd))
 }
 
 func (d *Driver) processNoopCommand(
@@ -320,6 +326,8 @@ func (d *Driver) logTaskToGPUInitiate(
 	req sim.Msg,
 ) {
 	tracing.TraceReqInitiate(req, now, d, cmd.GetID())
+	// log.Printf("%.10f, %s, gpu task start, %s, %s\n",
+	// 	now, d.Name(), reflect.TypeOf(req), req.Meta().Dst.Name())
 }
 
 func (d *Driver) logTaskToGPUClear(
@@ -327,6 +335,8 @@ func (d *Driver) logTaskToGPUClear(
 	req sim.Msg,
 ) {
 	tracing.TraceReqFinalize(req, now, d)
+	// log.Printf("%.10f, %s, gpu task end, %s, %s\n",
+	// 	now, d.Name(), reflect.TypeOf(req), req.Meta().Src.Name())
 }
 
 func (d *Driver) processLaunchKernelCommand(

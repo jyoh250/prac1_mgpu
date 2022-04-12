@@ -451,6 +451,10 @@ func (d *Disassembler) decodeVOPC(inst *Inst, buf []byte) error {
 
 	bits := int(extractBits(bytes, 9, 16))
 	inst.Src1 = NewVRegOperand(bits, bits, 0)
+	if inst.SRC1Width == 64 {
+		inst.Src1.RegCount = 2
+	}
+
 	return nil
 }
 

@@ -1,6 +1,8 @@
 package cu
 
 import (
+	"fmt"
+
 	"gitlab.com/akita/mem/v2/mem"
 	"gitlab.com/akita/mgpusim/v2/insts"
 	"gitlab.com/akita/mgpusim/v2/timing/wavefront"
@@ -62,6 +64,11 @@ func (c defaultCoalescer) generateReadReqs(
 		}
 
 		addr := addrs[i]
+
+		if addr >= 5_000_000_000_000_000_000 {
+			fmt.Print("Here")
+		}
+
 		for j := 0; j < regCount; j++ {
 			c.findOrCreateReadReq(&reqs, addr+uint64(4*j))
 		}

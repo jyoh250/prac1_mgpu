@@ -6,6 +6,7 @@ import (
 	"gitlab.com/akita/akita/v2/sim"
 	"gitlab.com/akita/mem/v2/mem"
 	"gitlab.com/akita/mgpusim/v2/insts"
+	"gitlab.com/akita/mgpusim/v2/protocol"
 	"gitlab.com/akita/mgpusim/v2/timing/wavefront"
 	"gitlab.com/akita/util/v2/tracing"
 )
@@ -99,11 +100,10 @@ func (s *SchedulerImpl) DecodeNextInst(now sim.VTimeInSec) bool {
 				continue
 			}
 
-			inst, err := s.cu.Decoder.Decode(
-				wf.InstBuffer[wf.PC-wf.InstBufferStartPC:])
+			buf := wf.InstBuffer[wf.PC-wf.InstBufferStartPC:]
+			inst, err := s.cu.Decoder.Decode(buf)
 			if err == nil {
 				wf.InstToIssue = wavefront.NewInst(inst)
-				// s.cu.logInstTask(now, wf, wf.InstToIssue, false)
 				madeProgress = true
 			}
 		}
@@ -168,7 +168,6 @@ func (s *SchedulerImpl) DoIssue(now sim.VTimeInSec) bool {
 		for _, wf := range wfs {
 			if wf.InstToIssue.ExeUnit == insts.ExeUnitSpecial {
 				madeProgress = s.issueToInternal(wf, now) || madeProgress
-
 				continue
 			}
 
@@ -181,7 +180,6 @@ func (s *SchedulerImpl) DoIssue(now sim.VTimeInSec) bool {
 
 				unit.AcceptWave(wf, now)
 				wf.State = wavefront.WfRunning
-				//s.removeStaleInstBuffer(wf)
 
 				madeProgress = true
 			}
@@ -190,7 +188,16 @@ func (s *SchedulerImpl) DoIssue(now sim.VTimeInSec) bool {
 	return madeProgress
 }
 
-func (s *SchedulerImpl) issueToInternal(wf *wavefront.Wavefront, now sim.VTimeInSec) bool {
+func (s *SchedulerImpl) issueToInternal(
+	wf *wavefront.Wavefront,
+	now sim.VTimeInSec,
+) bool {
+	for _, current := range s.internalExecuting {
+		if current == wf {
+			panic("Cannot issue the same wavefront twice in the scheduler.")
+		}
+	}
+
 	wf.SetDynamicInst(wf.InstToIssue)
 	wf.InstToIssue = nil
 	s.internalExecuting = append(s.internalExecuting, wf)
@@ -243,15 +250,14 @@ func (s *SchedulerImpl) EvaluateInternalInst(now sim.VTimeInSec) bool {
 			instProgress, instCompleted = s.evalSWaitCnt(executing, now)
 		default:
 			// The program has to make progress
+			s.cu.logInstTask(now, executing, executing.DynamicInst(), true)
 			executing.State = wavefront.WfReady
 			instProgress = true
 			instCompleted = true
 		}
 		madeProgress = instProgress || madeProgress
 
-		if instCompleted {
-			s.cu.logInstTask(now, executing, executing.DynamicInst(), true)
-		} else {
+		if !instCompleted {
 			newExecuting = append(newExecuting, executing)
 		}
 	}
@@ -270,13 +276,95 @@ func (s *SchedulerImpl) evalSEndPgm(
 		return false, false
 	}
 
-	wf.State = wavefront.WfCompleted
-	wfCompletionEvt := NewWfCompletionEvent(s.cu.Freq.NextTick(now), s.cu, wf)
-	s.cu.Engine.Schedule(wfCompletionEvt)
-	s.internalExecuting = nil
+	if s.areAllOtherWfsInWGCompleted(wf.WG, wf) {
+		done := s.sendWGCompletionMessage(now, wf.WG)
+		if !done {
+			return false, false
+		}
 
-	s.resetRegisterValue(wf)
-	return true, true
+		wf.State = wavefront.WfCompleted
+
+		s.resetRegisterValue(wf)
+		s.cu.clearWGResource(wf.WG)
+
+		s.cu.logInstTask(now, wf, wf.DynamicInst(), true)
+		tracing.EndTask(wf.UID, now, s.cu)
+		tracing.TraceReqComplete(wf.WG.MapReq, now, s.cu)
+
+		return true, true
+	}
+
+	if s.areAllOtherWfsInWGAtBarrier(wf.WG, wf) {
+		s.passBarrier(now, wf.WG)
+		s.resetRegisterValue(wf)
+
+		wf.State = wavefront.WfCompleted
+
+		tracing.EndTask(wf.UID, now, s.cu)
+
+		return true, true
+	}
+
+	if s.atLeaseOneWfIsExecuting(wf.WG) {
+		s.resetRegisterValue(wf)
+
+		wf.State = wavefront.WfCompleted
+
+		s.cu.logInstTask(now, wf, wf.DynamicInst(), true)
+		tracing.EndTask(wf.UID, now, s.cu)
+
+		return true, true
+	}
+
+	panic("never")
+}
+
+func (s *SchedulerImpl) areAllOtherWfsInWGCompleted(
+	wg *wavefront.WorkGroup,
+	currWf *wavefront.Wavefront,
+) bool {
+	for _, wf := range wg.Wfs {
+		if wf == currWf {
+			continue
+		}
+
+		if wf.State != wavefront.WfCompleted {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (s *SchedulerImpl) atLeaseOneWfIsExecuting(
+	wg *wavefront.WorkGroup,
+) bool {
+	for _, wf := range wg.Wfs {
+		if wf.State == wavefront.WfRunning || wf.State == wavefront.WfReady {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *SchedulerImpl) sendWGCompletionMessage(
+	now sim.VTimeInSec,
+	wg *wavefront.WorkGroup,
+) (done bool) {
+	mapReq := wg.MapReq
+	dispatcher := mapReq.Src
+
+	msg := protocol.WGCompletionMsgBuilder{}.
+		WithSendTime(now).
+		WithSrc(s.cu.ToACE).
+		WithDst(dispatcher).
+		WithRspTo(mapReq.ID).
+		Build()
+
+	err := s.cu.ToACE.Send(msg)
+
+	return err == nil
 }
 
 func (s *SchedulerImpl) resetRegisterValue(wf *wavefront.Wavefront) {
@@ -306,37 +394,54 @@ func (s *SchedulerImpl) evalSBarrier(
 	wf.State = wavefront.WfAtBarrier
 
 	wg := wf.WG
-	allAtBarrier := s.areAllWfInWGAtBarrier(wg)
+	allAtBarrier := s.areAllOtherWfsInWGAtBarrier(wg, wf)
 
 	if allAtBarrier {
-		s.passBarrier(wg)
+		s.passBarrier(now, wg)
 		return true, true
 	}
 
-	if len(s.barrierBuffer) < s.barrierBufferSize {
-		s.barrierBuffer = append(s.barrierBuffer, wf)
-		return true, true
-	}
-
-	return false, false
+	s.barrierBuffer = append(s.barrierBuffer, wf)
+	return true, true
 }
 
-func (s *SchedulerImpl) areAllWfInWGAtBarrier(wg *wavefront.WorkGroup) bool {
+func (s *SchedulerImpl) areAllOtherWfsInWGAtBarrier(
+	wg *wavefront.WorkGroup,
+	currWf *wavefront.Wavefront,
+) bool {
 	for _, wf := range wg.Wfs {
-		if wf.State != wavefront.WfAtBarrier {
+		if wf == currWf {
+			continue
+		}
+
+		if wf.State != wavefront.WfAtBarrier &&
+			wf.State != wavefront.WfCompleted {
 			return false
 		}
 	}
+
 	return true
 }
 
-func (s *SchedulerImpl) passBarrier(wg *wavefront.WorkGroup) {
+func (s *SchedulerImpl) passBarrier(
+	now sim.VTimeInSec,
+	wg *wavefront.WorkGroup,
+) {
 	s.removeAllWfFromBarrierBuffer(wg)
-	s.setAllWfStateToReady(wg)
+	s.setAllWfStateToReady(now, wg)
 }
 
-func (s *SchedulerImpl) setAllWfStateToReady(wg *wavefront.WorkGroup) {
+func (s *SchedulerImpl) setAllWfStateToReady(
+	now sim.VTimeInSec,
+	wg *wavefront.WorkGroup,
+) {
 	for _, wf := range wg.Wfs {
+		s.cu.logInstTask(now, wf, wf.DynamicInst(), true)
+
+		if wf.State == wavefront.WfCompleted {
+			continue
+		}
+
 		s.cu.UpdatePCAndSetReady(wf)
 	}
 }
@@ -367,7 +472,9 @@ func (s *SchedulerImpl) evalSWaitCnt(
 	}
 
 	if done {
+		s.cu.logInstTask(now, wf, wf.DynamicInst(), true)
 		s.cu.UpdatePCAndSetReady(wf)
+
 		return true, true
 	}
 

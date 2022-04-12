@@ -2,6 +2,7 @@ package tensor
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sync"
 	"time"
@@ -31,10 +32,15 @@ type GPUOperator struct {
 	cpuOperator  *tensor.CPUOperator
 
 	sumKernel                           *insts.HsaCo
+	sumNhwInNchwKernel                  *insts.HsaCo
 	transposeKernel                     *insts.HsaCo
+	nctocnTransposeLargeKernel          *insts.HsaCo
+	nctocnTransposeSmallKernel          *insts.HsaCo
 	repeatKernel                        *insts.HsaCo
 	rotateKernel                        *insts.HsaCo
+	rotateSmallKernel                   *insts.HsaCo
 	dilateKernel                        *insts.HsaCo
+	dilateZeroKernel                    *insts.HsaCo
 	im2ColKernel                        *insts.HsaCo
 	softmaxExpKernel                    *insts.HsaCo
 	reductionSumKernel                  *insts.HsaCo
@@ -50,6 +56,8 @@ type GPUOperator struct {
 	avgPoolingForwardKernel             *insts.HsaCo
 	avgPoolingBackwardKernel            *insts.HsaCo
 	gemmKernel                          *insts.HsaCo
+	gemmMulKernel                       *insts.HsaCo
+	gemmSumKernel                       *insts.HsaCo
 	crossEntropyDerivativeKernel        *insts.HsaCo
 	softmaxCrossEntropyDerivativeKernel *insts.HsaCo
 }
@@ -158,9 +166,14 @@ var crossEntropyKernelBytes []byte
 
 func (o *GPUOperator) loadKernels() {
 	loadKernel(&o.sumKernel, operatorKernelBytes, "sum_one_axis")
+	loadKernel(&o.sumNhwInNchwKernel, operatorKernelBytes, "sum_nhw_in_cnhw")
 	loadKernel(&o.transposeKernel, operatorKernelBytes, "transpose_tensor")
+	loadKernel(&o.nctocnTransposeLargeKernel, operatorKernelBytes, "convert_nchw_to_cnhw_large")
+	loadKernel(&o.nctocnTransposeSmallKernel, operatorKernelBytes, "convert_nchw_to_cnhw_small")
 	loadKernel(&o.rotateKernel, operatorKernelBytes, "rotate_tensor")
+	loadKernel(&o.rotateSmallKernel, operatorKernelBytes, "rotate_tensor_small")
 	loadKernel(&o.dilateKernel, operatorKernelBytes, "dilate_tensor")
+	loadKernel(&o.dilateZeroKernel, operatorKernelBytes, "dilate_zero_tensor")
 	loadKernel(&o.softmaxExpKernel, operatorKernelBytes, "softmax_exp")
 	loadKernel(&o.softmaxDivKernel, operatorKernelBytes, "softmax_div")
 	loadKernel(&o.scaleAddKernel, operatorKernelBytes, "scaleAdd")
@@ -175,7 +188,9 @@ func (o *GPUOperator) loadKernels() {
 	loadKernel(&o.maxPoolingBackwardKernel, maxPoolingKernelBytes, "MaxPoolBackward")
 	loadKernel(&o.avgPoolingForwardKernel, avgPoolingKernelBytes, "AvgPoolForward")
 	loadKernel(&o.avgPoolingBackwardKernel, avgPoolingKernelBytes, "AvgPoolBackward")
-	loadKernel(&o.gemmKernel, gemmKernelBytes, "gemm_old")
+	loadKernel(&o.gemmKernel, gemmKernelBytes, "gemm")
+	loadKernel(&o.gemmMulKernel, gemmKernelBytes, "gemm_mul")
+	loadKernel(&o.gemmSumKernel, gemmKernelBytes, "gemm_sum")
 	loadKernel(&o.crossEntropyDerivativeKernel, crossEntropyKernelBytes, "cross_entropy_derivative")
 	loadKernel(&o.softmaxCrossEntropyDerivativeKernel, crossEntropyKernelBytes, "softmax_cross_entropy_derivative")
 }
@@ -387,13 +402,6 @@ func (o *GPUOperator) Reshape(t tensor.Tensor, newSize []int) tensor.Tensor {
 	return out
 }
 
-type transposeKernelArgs struct {
-	In, Out, InSize, OutSize, Order driver.Ptr
-	InIndexBuf, OutIndexBuf         driver.Ptr
-	Dim, Padding                    int32
-	OffsetX, OffsetY, OffsetZ       int64
-}
-
 // Transpose reorders the axises of the tensor.
 func (o *GPUOperator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
 	input := t.(*Tensor)
@@ -401,18 +409,42 @@ func (o *GPUOperator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
 		panic("order should include all axes")
 	}
 
+	isNCCN := (len(order) == 2 && order[0] == 1) ||
+		(len(order) == 4 && order[0] == 1 &&
+			order[1] == 0 && order[2] == 2) // no need to check order[3]
+
+	var output tensor.Tensor
+
+	if !isNCCN {
+		output = o.vanillaTranspose(t, order)
+	} else {
+		output = o.nctocnTranspose(t, order)
+	}
+	o.setTransposeOutputDescriptor(output.(*Tensor), input, order)
+	o.verifyTranspose(output.(*Tensor), input, order)
+
+	return output
+}
+
+type transposeKernelArgs struct {
+	In, Out, InSize, OutSize, Order driver.Ptr
+	InIndexBuf, OutIndexBuf         driver.Ptr
+	Dim, Padding                    int32
+	OffsetX, OffsetY, OffsetZ       int64
+}
+
+func (o *GPUOperator) vanillaTranspose(t tensor.Tensor, order []int) tensor.Tensor {
 	dim := len(order)
+	outSize := make([]int, dim)
 	hOrder := make([]int32, dim)
 	hInSize := make([]int32, dim)
 	hOutSize := make([]int32, dim)
-	outSize := make([]int, dim)
 	for i := 0; i < dim; i++ {
+		outSize[i] = t.Size()[order[i]]
 		hOrder[i] = int32(order[i])
 		hInSize[i] = int32(t.Size()[i])
 		hOutSize[i] = int32(t.Size()[order[i]])
-		outSize[i] = t.Size()[order[i]]
 	}
-
 	output := o.Create(outSize).(*Tensor)
 
 	dOrder := o.driver.AllocateMemory(o.ctx, uint64(dim*sizeOfInt32))
@@ -450,11 +482,128 @@ func (o *GPUOperator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
 		&args,
 	)
 	o.timerEnd("Transpose")
-
-	o.setTransposeOutputDescriptor(output, input, order)
-	o.verifyTranspose(output, input, order)
-
 	return output
+}
+
+type nctocnTransposeLargeKernelArgs struct {
+	In, Out                driver.Ptr
+	DimX, DimY, DimZ, DimW int32
+	BlockSize              int32
+}
+
+type nctocnTransposeSmallKernelArgs struct {
+	In, Out                driver.Ptr
+	DimX, DimY, DimZ, DimW int32
+	NumTilesX              int32
+	NumTilesY              int32
+}
+
+func (o *GPUOperator) nctocnTranspose(
+	t tensor.Tensor, order []int,
+) tensor.Tensor {
+	dim := len(order)
+	outSize := make([]int, dim)
+	for i := 0; i < dim; i++ {
+		outSize[i] = t.Size()[order[i]]
+	}
+	output := o.Create(outSize).(*Tensor)
+
+	dims := t.Size()
+	blockSize := 64
+	// For 2D tensor transpose, we assume 4D tensor
+	// in which dimensions 3 and 4 are 1
+	// so effectively w dimension is y of 2D tensor
+	// and z dimensions is x of 2D tensor
+	sizeX := 1
+	sizeY := 1
+	sizeXY := 1
+	if dim == 4 {
+		sizeX = dims[3]
+		sizeY = dims[2]
+		sizeXY = sizeX * sizeY
+	}
+	if sizeXY < 64 {
+		o.runNCCNSmall(blockSize, sizeXY, t, output, sizeX, sizeY, dims)
+	} else {
+		o.runNCCNLarge(sizeXY, blockSize, t, output, sizeX, sizeY, dims)
+	}
+	return output
+}
+
+func (o *GPUOperator) runNCCNLarge(
+	sizeXY int, blockSize int,
+	t tensor.Tensor, output *Tensor,
+	sizeX int, sizeY int,
+	dims []int,
+) {
+	if sizeXY > 256 {
+		blockSize = 256
+	} else if sizeXY > 128 {
+		blockSize = 128
+	}
+	args := nctocnTransposeLargeKernelArgs{
+		In:        t.(*Tensor).ptr,
+		Out:       output.ptr,
+		DimX:      int32(sizeX),
+		DimY:      int32(sizeY),
+		DimZ:      int32(dims[1]),
+		DimW:      int32(dims[0]),
+		BlockSize: int32(blockSize),
+	}
+	o.timerStart()
+	o.driver.LaunchKernel(o.ctx,
+		o.nctocnTransposeLargeKernel,
+		[3]uint32{uint32(dims[0] * dims[1] * blockSize), 1, 1},
+		[3]uint16{uint16(blockSize), 1, 1},
+		&args,
+	)
+	o.timerEnd("NCCN Transpose")
+}
+
+func (o *GPUOperator) runNCCNSmall(
+	blockSize int, sizeXY int,
+	t tensor.Tensor, output *Tensor,
+	sizeX int, sizeY int,
+	dims []int,
+) {
+	// kernel for small matrices
+	// identify how many
+	// matrices fit in 256
+	// 16 fits to cache line, so memory access efficiency
+	// for these matrices is relatively good
+	// z axis
+	// w axis
+	blockSize = 256
+	numMatrices := blockSize / sizeXY
+
+	numTilesX, numTilesY := 1, 1
+	grid := int(math.Sqrt(float64(numMatrices)))
+
+	if sizeXY > 16 && numMatrices != grid*grid {
+		numTilesX = numMatrices
+	} else {
+		numTilesX, numTilesY = grid, grid
+	}
+	args := nctocnTransposeSmallKernelArgs{
+		In:        t.(*Tensor).ptr,
+		Out:       output.ptr,
+		DimX:      int32(sizeX),
+		DimY:      int32(sizeY),
+		DimZ:      int32(dims[1]),
+		DimW:      int32(dims[0]),
+		NumTilesX: int32(numTilesX),
+		NumTilesY: int32(numTilesY),
+	}
+	globalDimX := (dims[1]-1)/numTilesX + 1
+	globalDimY := (dims[0]-1)/numTilesY + 1
+	o.timerStart()
+	o.driver.LaunchKernel(o.ctx,
+		o.nctocnTransposeSmallKernel,
+		[3]uint32{uint32(globalDimX * globalDimY * blockSize), 1, 1},
+		[3]uint16{uint16(blockSize), 1, 1},
+		&args,
+	)
+	o.timerEnd("NCCN Transpose Small")
 }
 
 func (o *GPUOperator) setTransposeOutputDescriptor(
@@ -480,57 +629,59 @@ func (o *GPUOperator) verifyTranspose(
 }
 
 type rotateKernelArgs struct {
-	In, Out, InSize, OutSize  driver.Ptr
-	InIndexBuf, OutIndexBuf   driver.Ptr
-	Dim, Padding              int32
-	OffsetX, OffsetY, OffsetZ int64
+	In, Out              driver.Ptr
+	VolH, VolW, VolOther int32
 }
 
 // Rotate180 rotates the lowest two dimensions of the tensor by 180 degree.
 func (o *GPUOperator) Rotate180(t tensor.Tensor) tensor.Tensor {
+	inSize := t.Size()
 	dim := len(t.Size())
-	hInSize := make([]int32, dim)
-	hOutSize := make([]int32, dim)
-	outSize := make([]int, dim)
+	volTotal := 1
 	for i := 0; i < dim; i++ {
-		hInSize[i] = int32(t.Size()[i])
-		hOutSize[i] = int32(t.Size()[i])
-		outSize[i] = t.Size()[i]
+		volTotal *= inSize[i]
 	}
+	volH := t.Size()[dim-2]
+	volW := t.Size()[dim-1]
+	volOther := volTotal / (volH * volW)
 
-	output := o.Create(outSize).(*Tensor)
+	output := o.Create(inSize).(*Tensor)
 
-	dInSize := o.driver.AllocateMemory(o.ctx, uint64(dim*sizeOfInt32))
-	o.driver.MemCopyH2D(o.ctx, dInSize, hInSize)
-	defer o.driver.FreeMemory(o.ctx, dInSize)
-	dOutSize := o.driver.AllocateMemory(o.ctx, uint64(dim*sizeOfInt32))
-	o.driver.MemCopyH2D(o.ctx, dOutSize, hOutSize)
-	defer o.driver.FreeMemory(o.ctx, dOutSize)
-	dInIndexBuf := o.driver.AllocateMemory(o.ctx,
-		uint64(t.NumElement()*dim*sizeOfInt32))
-	defer o.driver.FreeMemory(o.ctx, dInIndexBuf)
-	dOutIndexBuf := o.driver.AllocateMemory(o.ctx,
-		uint64(t.NumElement()*dim*sizeOfInt32))
-	defer o.driver.FreeMemory(o.ctx, dOutIndexBuf)
+	blockSize := 256
+	numBlocks := volOther
+	numMatrices := 1
+	if blockSize > volH*volW {
+		numMatrices = blockSize / (volH * volW)
+		numBlocks = (volOther-1)/numMatrices + 1
+		volOther = numMatrices // for matrices with size <256
+	} // volOther is used as numMatrices
 
 	args := rotateKernelArgs{
-		In:          t.(*Tensor).ptr,
-		Out:         output.ptr,
-		InSize:      dInSize,
-		OutSize:     dOutSize,
-		InIndexBuf:  dInIndexBuf,
-		OutIndexBuf: dOutIndexBuf,
-		Dim:         int32(len(t.Size())),
+		In:       t.(*Tensor).ptr,
+		Out:      output.ptr,
+		VolH:     int32(volH),
+		VolW:     int32(volW),
+		VolOther: int32(volOther), // for matrices with size <256
+	} // volOther is used as numMatrices
+	if numMatrices <= 1 {
+		o.timerStart()
+		o.driver.LaunchKernel(o.ctx,
+			o.rotateKernel,
+			[3]uint32{uint32(numBlocks * blockSize), 1, 1},
+			[3]uint16{uint16(blockSize), 1, 1},
+			&args,
+		)
+		o.timerEnd("Rotate180")
+	} else {
+		o.timerStart()
+		o.driver.LaunchKernel(o.ctx,
+			o.rotateSmallKernel,
+			[3]uint32{uint32(numBlocks * blockSize), 1, 1},
+			[3]uint16{uint16(blockSize), 1, 1},
+			&args,
+		)
+		o.timerEnd("Rotate180 Small")
 	}
-
-	o.timerStart()
-	o.driver.LaunchKernel(o.ctx,
-		o.rotateKernel,
-		[3]uint32{uint32(t.NumElement()), 1, 1},
-		[3]uint16{64, 1, 1},
-		&args,
-	)
-	o.timerEnd("Rotate180")
 
 	if o.verification {
 		cpuIn := o.gpuTensorToCPUTensor(t)
@@ -543,17 +694,15 @@ func (o *GPUOperator) Rotate180(t tensor.Tensor) tensor.Tensor {
 }
 
 type dilateKernelArgs struct {
-	In, Out, InSize, OutSize  driver.Ptr
-	Dilate                    driver.Ptr
-	InIndexBuf, OutIndexBuf   driver.Ptr
-	Dim, Padding              int32
-	OffsetX, OffsetY, OffsetZ int64
+	In, Out          driver.Ptr
+	InVolH, InVolW   int32
+	OutVolH, OutVolW int32
+	DilateX, DilateY int32
 }
 
 // Dilate adds 0s between rows and columns.
 func (o *GPUOperator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
 	dim := len(t.Size())
-	hDilate := []int32{int32(dilate[0]), int32(dilate[1])}
 
 	outSize := make([]int, len(t.Size()))
 	copy(outSize, t.Size())
@@ -562,48 +711,48 @@ func (o *GPUOperator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
 	outSize[len(outSize)-2] = (outSize[len(outSize)-2]-1)*dilate[0] + 1
 	output := o.Create(outSize).(*Tensor)
 
-	hInSize := make([]int32, dim)
-	hOutSize := make([]int32, dim)
-	for i := 0; i < dim; i++ {
-		hInSize[i] = int32(t.Size()[i])
-		hOutSize[i] = int32(outSize[i])
-	}
-
-	dInSize := o.driver.AllocateMemory(o.ctx, uint64(dim*sizeOfInt32))
-	o.driver.MemCopyH2D(o.ctx, dInSize, hInSize)
-	defer o.driver.FreeMemory(o.ctx, dInSize)
-	dOutSize := o.driver.AllocateMemory(o.ctx, uint64(dim*sizeOfInt32))
-	o.driver.MemCopyH2D(o.ctx, dOutSize, hOutSize)
-	defer o.driver.FreeMemory(o.ctx, dOutSize)
-	dDilate := o.driver.AllocateMemory(o.ctx, uint64(2*sizeOfInt32))
-	o.driver.MemCopyH2D(o.ctx, dDilate, hDilate)
-	defer o.driver.FreeMemory(o.ctx, dDilate)
-	dInIndexBuf := o.driver.AllocateMemory(o.ctx,
-		uint64(output.NumElement()*dim*sizeOfInt32))
-	defer o.driver.FreeMemory(o.ctx, dInIndexBuf)
-	dOutIndexBuf := o.driver.AllocateMemory(o.ctx,
-		uint64(output.NumElement()*dim*sizeOfInt32))
-	defer o.driver.FreeMemory(o.ctx, dOutIndexBuf)
-
 	args := dilateKernelArgs{
-		In:          t.(*Tensor).ptr,
-		Out:         output.ptr,
-		InSize:      dInSize,
-		OutSize:     dOutSize,
-		Dilate:      dDilate,
-		InIndexBuf:  dInIndexBuf,
-		OutIndexBuf: dOutIndexBuf,
-		Dim:         int32(len(t.Size())),
+		In:      t.(*Tensor).ptr,
+		Out:     output.ptr,
+		InVolH:  int32(t.Size()[dim-2]),
+		InVolW:  int32(t.Size()[dim-1]),
+		OutVolH: int32(outSize[len(outSize)-2]),
+		OutVolW: int32(outSize[len(outSize)-1]),
+		DilateX: int32(dilate[1]),
+		DilateY: int32(dilate[0]),
 	}
 
-	o.timerStart()
-	o.driver.LaunchKernel(o.ctx,
-		o.dilateKernel,
-		[3]uint32{uint32(output.NumElement()), 1, 1},
-		[3]uint16{64, 1, 1},
-		&args,
-	)
-	o.timerEnd("Dilate")
+	// If output tensor already consists of zeros
+	// we can just change indices corresponding to
+	// the input tensor. Dilate-Zero kernel does that.
+	// If output tensor is initialized with random numbers,
+	// then we have to change every element of the tensor.
+	// Dilate kernel does that.
+	// P.S. It is better to memset 0s and use Dilate-Zero rather
+	// 		than using Dilate, because Dilate-Zero is muuuuch
+	// 		faster.
+
+	isOutputSetToZero := true
+
+	if isOutputSetToZero {
+		o.timerStart()
+		o.driver.LaunchKernel(o.ctx,
+			o.dilateZeroKernel,
+			[3]uint32{uint32(t.NumElement()), 1, 1},
+			[3]uint16{256, 1, 1},
+			&args,
+		)
+		o.timerEnd("Dilate-Zero")
+	} else {
+		o.timerStart()
+		o.driver.LaunchKernel(o.ctx,
+			o.dilateKernel,
+			[3]uint32{uint32(t.NumElement()), 1, 1},
+			[3]uint16{256, 1, 1},
+			&args,
+		)
+		o.timerEnd("Dilate")
+	}
 
 	o.verifyDilate(t, dilate, output)
 
@@ -626,14 +775,24 @@ func (o *GPUOperator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
 	o.axisMustBeIncreasing(axis)
 
 	in = t
-	for i, a := range axis {
-		out = o.sumOneAxis(in, a-i)
+	sumAcrossC := len(axis) == 3 &&
+		in.Dim() == 4 &&
+		axis[0] == 0 &&
+		axis[1] == 2 &&
+		axis[2] == 3
 
-		if i > 0 {
-			o.Free(in)
+	if sumAcrossC {
+		out = o.sumNhwInNchw(in)
+	} else {
+		for i, a := range axis {
+			out = o.sumOneAxis(in, a-i)
+
+			if i > 0 {
+				o.Free(in)
+			}
+
+			in = out
 		}
-
-		in = out
 	}
 
 	if o.verification {
@@ -722,6 +881,33 @@ func (o *GPUOperator) sumOneAxis(t tensor.Tensor, axis int) tensor.Tensor {
 	return out
 }
 
+type sumNhwInNchwKernelKernelArgs struct {
+	In, Out          driver.Ptr
+	Dim1, Dim2, Dim3 int32
+}
+
+func (o *GPUOperator) sumNhwInNchw(t tensor.Tensor) tensor.Tensor {
+	dims := t.Size()
+	out := o.Create([]int{dims[1]})
+	in := o.Transpose(t, []int{1, 0, 2, 3})
+	args := sumNhwInNchwKernelKernelArgs{
+		In:   in.(*Tensor).ptr,
+		Out:  out.(*Tensor).ptr,
+		Dim1: int32(dims[0]),
+		Dim2: int32(dims[2]),
+		Dim3: int32(dims[3]),
+	}
+	blockSize := 128
+	o.timerStart()
+	o.driver.LaunchKernel(o.ctx, o.sumNhwInNchwKernel,
+		[3]uint32{uint32(dims[1] * blockSize), 1, 1},
+		[3]uint16{uint16(blockSize), 1, 1},
+		&args,
+	)
+	o.timerEnd("Sum")
+	return out
+}
+
 type gemmKernArgs struct {
 	M, N, K                   int32
 	Alpha, Beta               float32
@@ -746,7 +932,20 @@ func (o *GPUOperator) Gemm(
 		tempB = o.Transpose(b, []int{1, 0})
 	}
 
-	d := o.matrixMultiplication(alpha, beta, tempA, tempB, c)
+	m := tempA.Size()[0]
+	n := tempB.Size()[1]
+	k := tempB.Size()[0]
+	maxMN := m
+	if n > maxMN {
+		maxMN = n
+	}
+	var d tensor.Tensor
+	if (m >= 64 && n >= 64 && m*n <= k*48) || // some dark magic based
+		k >= 8*maxMN { // on empirical analysis
+		d = o.matrixMultiplicationScheme2(alpha, beta, tempA, tempB, c)
+	} else {
+		d = o.matrixMultiplication(alpha, beta, tempA, tempB, c)
+	}
 
 	if transA {
 		o.Free(tempA)
@@ -756,6 +955,17 @@ func (o *GPUOperator) Gemm(
 		o.Free(tempB)
 	}
 
+	o.doGemmVerification(a, b, c, transA, transB, alpha, beta, d)
+
+	return d
+}
+
+func (o *GPUOperator) doGemmVerification(
+	a, b, c tensor.Tensor,
+	transA, transB bool,
+	alpha, beta float64,
+	d tensor.Tensor,
+) {
 	if o.verification {
 		cpuA := o.gpuTensorToCPUTensor(a)
 		cpuB := o.gpuTensorToCPUTensor(b)
@@ -765,8 +975,6 @@ func (o *GPUOperator) Gemm(
 		o.tensorMustMatch(cpuOut, d)
 		fmt.Println("Gemm verified.")
 	}
-
-	return d
 }
 
 func (o *GPUOperator) matrixMultiplication(
@@ -778,6 +986,8 @@ func (o *GPUOperator) matrixMultiplication(
 	m := a.Size()[0]
 	n := b.Size()[1]
 	k := b.Size()[0]
+
+	log.Printf("Gemm size: m %d, n %d, k %d\n", m, n, k)
 
 	blockSize := 16
 	wiWidth := ((n-1)/blockSize + 1) * blockSize
@@ -796,7 +1006,6 @@ func (o *GPUOperator) matrixMultiplication(
 		C:     c.(*Tensor).ptr,
 		D:     d.(*Tensor).ptr,
 	}
-
 	o.timerStart()
 	o.driver.LaunchKernel(
 		o.ctx,
@@ -808,6 +1017,118 @@ func (o *GPUOperator) matrixMultiplication(
 	o.timerEnd("Gemm")
 
 	return d
+}
+
+type gemmMulKernelArgs struct {
+	M, N, K                      int32
+	NumSuperTile, SuperTileWidth int32
+	Padding                      int32
+	A, B, Out                    driver.Ptr
+	OffsetX, OffsetY, OffsetZ    int64
+}
+
+type gemmSumKernelArgs struct {
+	M, N, K                   int32
+	Alpha, Beta               float32
+	NumSuperTile              int32
+	SuperTiles, C, D          driver.Ptr
+	OffsetX, OffsetY, OffsetZ int64
+}
+
+func (o *GPUOperator) matrixMultiplicationScheme2(
+	alpha, beta float64,
+	a, b, c tensor.Tensor,
+) tensor.Tensor {
+	o.gemmDimMustBeValid(a, b, c)
+
+	m := a.Size()[0]
+	n := b.Size()[1]
+	k := b.Size()[0]
+
+	log.Printf("Gemm2 size: m %d, n %d, k %d\n", m, n, k)
+
+	tileSize := 16
+	tileXPerSuperTile := (n-1)/tileSize + 1
+	tileYPerSuperTile := (m-1)/tileSize + 1
+
+	// 60 is empirical number, based on the behavior of GTX 1070 GPU
+	numSuperTile := 60 / (tileXPerSuperTile * tileYPerSuperTile)
+	if numSuperTile < 15 {
+		numSuperTile = 15
+	}
+
+	d := o.Create([]int{m, n})
+	o.timerStart()
+	out := o.gemmMul(m, n, k, numSuperTile, a, b, tileSize)
+	o.gemmSum(alpha, beta, m, n, k, numSuperTile, tileSize, out, c, d)
+	o.timerEnd("Gemm")
+	o.Free(out)
+
+	return d
+}
+
+func (o *GPUOperator) gemmMul(
+	m, n, k int,
+	numSuperTile int,
+	a, b tensor.Tensor,
+	tileSize int,
+) tensor.Tensor {
+	tileXPerSuperTile := (n-1)/tileSize + 1
+	tileYPerSuperTile := (m-1)/tileSize + 1
+	superTileWidth := numSuperTile * tileSize
+	globalSize := []uint32{
+		uint32(tileXPerSuperTile * numSuperTile * tileSize),
+		uint32(tileYPerSuperTile * tileSize),
+	}
+
+	out := o.Create([]int{tileYPerSuperTile * tileSize, tileXPerSuperTile * superTileWidth})
+
+	kernArg := gemmMulKernelArgs{
+		M:              int32(m),
+		N:              int32(n),
+		K:              int32(k),
+		NumSuperTile:   int32(numSuperTile),
+		SuperTileWidth: int32(superTileWidth),
+		A:              a.(*Tensor).ptr,
+		B:              b.(*Tensor).ptr,
+		Out:            out.(*Tensor).ptr,
+	}
+
+	o.driver.LaunchKernel(
+		o.ctx,
+		o.gemmMulKernel,
+		[3]uint32{globalSize[0], globalSize[1], 1},
+		[3]uint16{uint16(tileSize), uint16(tileSize), 1},
+		&kernArg,
+	)
+
+	return out
+}
+
+func (o *GPUOperator) gemmSum(
+	alpha, beta float64,
+	m, n, k int,
+	numSuperTile, tileSize int,
+	out, c, d tensor.Tensor,
+) {
+	sumKernArg := gemmSumKernelArgs{
+		M:            int32(m),
+		N:            int32(n),
+		K:            int32(k),
+		NumSuperTile: int32(numSuperTile),
+		SuperTiles:   out.(*Tensor).ptr,
+		C:            c.(*Tensor).ptr,
+		D:            d.(*Tensor).ptr,
+		Alpha:        float32(alpha),
+		Beta:         float32(beta),
+	}
+	o.driver.LaunchKernel(
+		o.ctx,
+		o.gemmSumKernel,
+		[3]uint32{uint32(n), uint32(m), 1},
+		[3]uint16{uint16(tileSize), uint16(tileSize), 1},
+		&sumKernArg,
+	)
 }
 
 func (o *GPUOperator) gemmDimMustBeValid(a, b, c tensor.Tensor) {
@@ -879,7 +1200,7 @@ func (o *GPUOperator) Im2Col(
 		Batch:    uint32(inputSize[0]),
 	}
 
-	fmt.Printf("Im2Col input %v, kernel %v, stride %v, padding %v, "+
+	log.Printf("Im2Col input %v, kernel %v, stride %v, padding %v, "+
 		"dilation %v, output %v\n",
 		inputSize, kernelSize, stride, padding, dilation, output.Size())
 
@@ -920,7 +1241,7 @@ func (o *GPUOperator) timerEnd(
 		o.vEnd = o.driver.Engine.CurrentTime()
 		o.end = time.Now()
 
-		fmt.Printf("Kernel %s, Start %.10f, Virtual Time: %v, Real Time: %v\n",
+		log.Printf("Kernel %s, Start %.10f, Virtual Time: %v, Real Time: %v\n",
 			kernelName, o.vStart, o.vEnd-o.vStart, o.end.Sub(o.start))
 		o.timerMutex.Unlock()
 	}

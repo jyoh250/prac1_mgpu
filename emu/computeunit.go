@@ -360,7 +360,7 @@ func (cu *ComputeUnit) resolveBarrier(wg *kernels.WorkGroup) {
 	}
 
 	for _, wf := range cu.wfs[wg] {
-		if !wf.AtBarrier {
+		if !wf.AtBarrier && !wf.Completed {
 			log.Panic("not all wavefronts at barrier")
 		}
 		wf.AtBarrier = false

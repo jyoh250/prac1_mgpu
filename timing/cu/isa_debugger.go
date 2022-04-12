@@ -45,11 +45,11 @@ func (h *ISADebugger) StartTask(task tracing.Task) {
 	// For debugging
 	detail := task.Detail.(map[string]interface{})
 	wf := detail["wf"].(*wavefront.Wavefront)
-	if wf.FirstWiFlatID != 0 {
-		return
-	}
 
-	h.executingInst[task.ID] = task
+	if wf.WG.IDX == 1120 && wf.WG.IDY == 0 &&
+		wf.WG.IDZ == 0 && wf.FirstWiFlatID == 128 {
+		h.executingInst[task.ID] = task
+	}
 }
 
 // StepTask does nothing as of now.
@@ -69,7 +69,8 @@ func (h *ISADebugger) EndTask(task tracing.Task) {
 	wf := detail["wf"].(*wavefront.Wavefront)
 	inst := detail["inst"].(*wavefront.Inst).Inst
 
-	if wf.WG.IDX == 75 && wf.WG.IDY == 1 {
+	if wf.WG.IDX == 1120 && wf.WG.IDY == 0 &&
+		wf.WG.IDZ == 0 && wf.FirstWiFlatID == 128 {
 		h.logWholeWf(inst, wf)
 	}
 

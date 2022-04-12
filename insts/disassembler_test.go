@@ -272,4 +272,24 @@ var _ = Describe("Disassembler", func() {
 		Expect(inst.String(nil)).
 			To(Equal("ds_read_b128 v[17:20], v1 offset:128"))
 	})
+
+	It("should decode 7DDA0A80", func() {
+		buf := []byte{0x80, 0x0a, 0xda, 0x7d}
+
+		inst, err := disassembler.Decode(buf)
+
+		Expect(err).To(BeNil())
+		Expect(inst.String(nil)).
+			To(Equal("v_cmp_ne_u64_e32 vcc, 0, v[5:6]"))
+	})
+
+	It("should decode 3C120C80", func() {
+		buf := []byte{0x80, 0x0c, 0x12, 0x3c}
+
+		inst, err := disassembler.Decode(buf)
+
+		Expect(err).To(BeNil())
+		Expect(inst.String(nil)).
+			To(Equal("v_subbrev_u32_e32 v9, vcc, 0, v6, vcc"))
+	})
 })

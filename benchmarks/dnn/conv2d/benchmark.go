@@ -2,6 +2,8 @@
 package conv2d
 
 import (
+	"fmt"
+
 	"gitlab.com/akita/dnn/layers"
 	"gitlab.com/akita/dnn/tensor"
 	gpuTensor "gitlab.com/akita/mgpusim/v2/benchmarks/dnn/tensor"
@@ -76,6 +78,7 @@ func (b *Benchmark) calculateOutputSize() {
 
 func (b *Benchmark) initMem() {
 	b.layer = layers.NewConv2D(
+		1,
 		b.operator,
 		[]int{b.C, b.H, b.W},
 		[]int{b.KernelChannel, b.C, b.KernelHeight, b.KernelWidth},
@@ -93,10 +96,18 @@ func (b *Benchmark) initMem() {
 }
 
 func (b *Benchmark) exec() {
+	start := b.driver.Engine.CurrentTime()
 	b.layer.Forward(b.forwardIn)
+	afterForward := b.driver.Engine.CurrentTime()
+	forwardTime := afterForward - start
+	fmt.Printf("Forward Time: %.10f\n", forwardTime)
 
 	if b.EnableBackward {
 		b.layer.Backward(b.backwardIn)
+		afterBackward := b.driver.Engine.CurrentTime()
+		backwardTime := afterBackward - afterForward
+
+		fmt.Printf("Backward Time %.10f, ratio %f\n", backwardTime, backwardTime/forwardTime)
 	}
 }
 

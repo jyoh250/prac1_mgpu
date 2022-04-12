@@ -264,7 +264,5 @@ func (m *defaultMemoryCopyMiddleware) processFlushReturn(
 
 	cmd.RemoveReq(req)
 
-	m.driver.logTaskToGPUClear(now, req)
-
 	return true
 }

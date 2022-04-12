@@ -99,10 +99,22 @@ func (t DataParallelismMultiGPUTrainer) calculateBatchGradientOneGPU(
 	lossFunc training.LossFunction,
 ) {
 	defer wg.Done()
+	startForward := t.Driver.Engine.CurrentTime()
 
 	output := t.forward(data, &network)
+
+	endForward := t.Driver.Engine.CurrentTime()
+	forwardTime := endForward - startForward
+	log.Printf("Forward Time: %.10f\n", forwardTime)
+
 	derivative := t.calculateLoss(output, label, lossFunc)
+
+	startBack := t.Driver.Engine.CurrentTime()
+
 	t.backward(derivative, &network)
+
+	endBack := t.Driver.Engine.CurrentTime()
+	log.Printf("Backward Time: %.10f\n", endBack-startBack)
 }
 
 func (t DataParallelismMultiGPUTrainer) forward(
@@ -111,8 +123,9 @@ func (t DataParallelismMultiGPUTrainer) forward(
 ) tensor.Tensor {
 	var input, output tensor.Tensor
 	output = data
-	for _, l := range network.Layers {
+	for i, l := range network.Layers {
 		input = output
+		log.Printf("Layer: %d\n", i)
 		output = l.Forward(input)
 	}
 	return output
@@ -141,6 +154,7 @@ func (t DataParallelismMultiGPUTrainer) backward(
 	output = derivative
 	for i := len(network.Layers) - 1; i >= 0; i-- {
 		input := output
+		log.Printf("Layer: %d\n", i)
 		output = network.Layers[i].Backward(input)
 	}
 }

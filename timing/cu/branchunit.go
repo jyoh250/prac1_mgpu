@@ -75,6 +75,7 @@ func (u *BranchUnit) runReadStage(now sim.VTimeInSec) bool {
 
 		return true
 	}
+
 	return false
 }
 
@@ -84,13 +85,34 @@ func (u *BranchUnit) runExecStage(now sim.VTimeInSec) bool {
 	}
 
 	if u.toWrite == nil {
+		pcBefore := u.toExec.Scratchpad().AsSOPP().PC
+
 		u.alu.Run(u.toExec)
+
+		pcAfter := u.toExec.Scratchpad().AsSOPP().PC
+
+		if u.isTaken(pcBefore, pcAfter) {
+			u.toExec.InstBuffer = nil
+			u.toExec.InstToIssue = nil
+			u.toExec.InstBufferStartPC = (pcAfter + 4) & 0xffffffffffffffc0
+		}
 
 		u.toWrite = u.toExec
 		u.toExec = nil
+
 		return true
 	}
 	return false
+}
+
+func (u *BranchUnit) isTaken(
+	pcBefore, pcAfter uint64,
+) bool {
+	if pcBefore == pcAfter {
+		return false
+	}
+
+	return true
 }
 
 func (u *BranchUnit) runWriteStage(now sim.VTimeInSec) bool {
@@ -102,11 +124,11 @@ func (u *BranchUnit) runWriteStage(now sim.VTimeInSec) bool {
 
 	u.cu.logInstTask(now, u.toWrite, u.toWrite.DynamicInst(), true)
 
-	u.toWrite.InstBuffer = nil
 	u.cu.UpdatePCAndSetReady(u.toWrite)
-	u.toWrite.InstBufferStartPC = u.toWrite.PC & 0xffffffffffffffc0
+
 	u.toWrite = nil
 	u.isIdle = false
+
 	return true
 }
 

@@ -19,6 +19,25 @@ float f32abs(float a) {
   return a;
 }
 
+void dump_gpu_matrix(cl_command_queue queue, cl_mem matrix, int rows,
+                     int cols) {
+  float *cpu_matrix;
+  cpu_matrix = (float *)malloc(rows * cols * sizeof(float));
+
+  clEnqueueReadBuffer(queue, matrix, CL_TRUE, 0, rows * cols * sizeof(float),
+                      cpu_matrix, 0, NULL, NULL);
+  clFinish(queue);
+
+  for (int i = 0; i < rows; i++) {
+    for (int j = 0; j < cols; j++) {
+      printf("%f ", cpu_matrix[i * cols + j]);
+    }
+    printf("\n");
+  }
+
+  free(cpu_matrix);
+}
+
 char *read_file(const char *filename) {
   char *buffer = 0;
   long length;
@@ -38,20 +57,19 @@ char *read_file(const char *filename) {
   return buffer;
 }
 
-// m = 17, n = 11, k = 9
-// alpha * a * b + beta * c
-// alpha = 3.1, beta = 4.2
-// d = numpy.matmul(a, b) * alpha + beta * c
-
 int main(int argc, char *argv[]) {
   int m = 6;
   int n = 25;
   int k = 36864;
-  float alpha = 1;
-  float beta = 0;
+  printf("Sizes m=%d, n=%d, k=%d\n", m, n, k);
+
+  float alpha = 0.4;
+  float beta = 0.3;
+  int num_supertile = 512;
 
   float *h_input_a;
   float *h_input_b;
+  float *h_outer;
   float *h_input_c;
   float *cpu_out;
   float *gpu_out;
@@ -63,18 +81,18 @@ int main(int argc, char *argv[]) {
   gpu_out = malloc(m * n * sizeof(float));
 
   for (int i = 0; i < m * k; i++) {
-    // h_input_a[i] = (float)rand() / (float)RAND_MAX;
-    h_input_a[i] = 1;
+    h_input_a[i] = (float)rand() / (float)RAND_MAX;
+    // h_input_a[i] = i;
   }
 
   for (int i = 0; i < n * k; i++) {
-    // h_input_b[i] = (float)rand() / (float)RAND_MAX;
-    h_input_b[i] = 2;
+    h_input_b[i] = (float)rand() / (float)RAND_MAX;
+    // h_input_b[i] = i;
   }
 
   for (int i = 0; i < m * n; i++) {
-    // h_input_c[i] = (float)rand() / (float)RAND_MAX;
-    h_input_c[i] = 3;
+    h_input_c[i] = (float)rand() / (float)RAND_MAX;
+    // h_input_c[i] = i;
   }
 
   for (int x = 0; x < n; x++) {
@@ -91,19 +109,23 @@ int main(int argc, char *argv[]) {
   // Device input buffers
   cl_mem d_input_a;
   cl_mem d_input_b;
+  cl_mem d_outer;
   cl_mem d_input_c;
   cl_mem d_output;
 
-  cl_platform_id cpPlatform;  // OpenCL platform
-  cl_device_id device_id;     // device ID
-  cl_context context;         // context
-  cl_command_queue queue;     // command queue
-  cl_program program;         // program
-  cl_kernel kernel;           // kernel
+  cl_platform_id cpPlatform;         // OpenCL platform
+  cl_device_id device_id;            // device ID
+  cl_context context;                // context
+  cl_command_queue queue;            // command queue
+  cl_program program;                // program
+  cl_kernel kernel_mul, kernel_sum;  // kernel
 
   int tile_size = 16;
-  size_t globalSize[2] = {((n - 1) / tile_size + 1) * tile_size,
-                          ((m - 1) / tile_size + 1) * tile_size};
+  int tile_x_per_supertile = (n - 1) / tile_size + 1;
+  int tile_y_per_supertile = (m - 1) / tile_size + 1;
+  int super_tile_width = tile_x_per_supertile * tile_size;
+  size_t globalSize[2] = {tile_x_per_supertile * num_supertile * tile_size,
+                          tile_y_per_supertile * tile_size};
   size_t localSize[2] = {tile_size, tile_size};
   cl_int err;
 
@@ -171,8 +193,13 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  // Create the compute kernel in the program we wish to run
-  kernel = clCreateKernel(program, "gemm", &err);
+  kernel_mul = clCreateKernel(program, "gemm_mul", &err);
+  if (err != CL_SUCCESS) {
+    printf("fail to create kernel %d\n", err);
+    exit(1);
+  }
+
+  kernel_sum = clCreateKernel(program, "gemm_sum", &err);
   if (err != CL_SUCCESS) {
     printf("fail to create kernel %d\n", err);
     exit(1);
@@ -185,6 +212,10 @@ int main(int argc, char *argv[]) {
                              NULL, NULL);
   d_input_c = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * m * n,
                              NULL, NULL);
+  size_t d_outer_size = sizeof(float) * m * (n * num_supertile);
+  printf("d_outer_size %d x %d = %ld\n", n * num_supertile, m, d_outer_size);
+  d_outer =
+      clCreateBuffer(context, CL_MEM_READ_WRITE, d_outer_size, NULL, NULL);
   d_output = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * m * n,
                             NULL, NULL);
 
@@ -201,22 +232,46 @@ int main(int argc, char *argv[]) {
   }
 
   // Set the arguments to our compute kernel
-  err |= clSetKernelArg(kernel, 0, sizeof(cl_int), &m);
-  err |= clSetKernelArg(kernel, 1, sizeof(cl_int), &n);
-  err |= clSetKernelArg(kernel, 2, sizeof(cl_int), &k);
-  err |= clSetKernelArg(kernel, 3, sizeof(cl_float), &alpha);
-  err |= clSetKernelArg(kernel, 4, sizeof(cl_float), &beta);
-  err |= clSetKernelArg(kernel, 5, sizeof(cl_mem), &d_input_a);
-  err |= clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_input_b);
-  err |= clSetKernelArg(kernel, 7, sizeof(cl_mem), &d_input_c);
-  err |= clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_output);
+  err = clSetKernelArg(kernel_mul, 0, sizeof(cl_int), &m);
+  err |= clSetKernelArg(kernel_mul, 1, sizeof(cl_int), &n);
+  err |= clSetKernelArg(kernel_mul, 2, sizeof(cl_int), &k);
+  err |= clSetKernelArg(kernel_mul, 3, sizeof(cl_int), &num_supertile);
+  err |= clSetKernelArg(kernel_mul, 4, sizeof(cl_int), &super_tile_width);
+  err |= clSetKernelArg(kernel_mul, 5, sizeof(cl_mem), &d_input_a);
+  err |= clSetKernelArg(kernel_mul, 6, sizeof(cl_mem), &d_input_b);
+  err |= clSetKernelArg(kernel_mul, 7, sizeof(cl_mem), &d_outer);
+  if (err != CL_SUCCESS) {
+    printf("fail to set kernel arguments %d\n", err);
+  }
+
+  err = clSetKernelArg(kernel_sum, 0, sizeof(cl_int), &m);
+  err |= clSetKernelArg(kernel_sum, 1, sizeof(cl_int), &n);
+  err |= clSetKernelArg(kernel_sum, 2, sizeof(cl_int), &k);
+  err |= clSetKernelArg(kernel_sum, 3, sizeof(float), &alpha);
+  err |= clSetKernelArg(kernel_sum, 4, sizeof(float), &beta);
+  err |= clSetKernelArg(kernel_sum, 5, sizeof(cl_int), &num_supertile);
+  err |= clSetKernelArg(kernel_sum, 6, sizeof(cl_mem), &d_outer);
+  err |= clSetKernelArg(kernel_sum, 7, sizeof(cl_mem), &d_input_c);
+  err |= clSetKernelArg(kernel_sum, 8, sizeof(cl_mem), &d_output);
+  if (err != CL_SUCCESS) {
+    printf("fail to set kernel arguments %d\n", err);
+  }
 
   // Execute the kernel over the entire range of the data set
   uint64_t start = getTimeInNSecs();
-  err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, globalSize, localSize, 0,
-                               NULL, NULL);
+  err = clEnqueueNDRangeKernel(queue, kernel_mul, 2, NULL, globalSize,
+                               localSize, 0, NULL, NULL);
   if (err != CL_SUCCESS) {
-    printf("fail to enqueue ND Range Kernel");
+    printf("fail to enqueue ND Range Kernel\n");
+    exit(1);
+  }
+
+  size_t sum_global_size[2] = {n, m};
+  size_t sum_local_size[2] = {16, 16};
+  err = clEnqueueNDRangeKernel(queue, kernel_sum, 2, NULL, sum_global_size,
+                               sum_local_size, 0, NULL, NULL);
+  if (err != CL_SUCCESS) {
+    printf("fail to enqueue ND Range Kernel\n");
     exit(1);
   }
 
@@ -230,7 +285,22 @@ int main(int argc, char *argv[]) {
 
   printf("Time %ld\n", end - start);
 
-  // Read the results from the device
+  //   printf("Matrix A\n");
+  //   dump_gpu_matrix(queue, d_input_a, m, k);
+
+  //   printf("Matrix B\n");
+  //   dump_gpu_matrix(queue, d_input_b, k, n);
+
+  //   printf("Matrix C\n");
+  //   dump_gpu_matrix(queue, d_input_c, m, n);
+
+  //   printf("Outer Matrix\n");
+  //   dump_gpu_matrix(queue, d_outer, m, n * num_supertile);
+
+  //   printf("Output Matrix\n");
+  //   dump_gpu_matrix(queue, d_output, m, n);
+
+  //   Read the results from the device
   clEnqueueReadBuffer(queue, d_output, CL_TRUE, 0, m * n * sizeof(float),
                       gpu_out, 0, NULL, NULL);
   err = clFinish(queue);
@@ -251,7 +321,8 @@ int main(int argc, char *argv[]) {
 
   // release OpenCL resources
   clReleaseProgram(program);
-  clReleaseKernel(kernel);
+  clReleaseKernel(kernel_mul);
+  clReleaseKernel(kernel_sum);
   clReleaseCommandQueue(queue);
   clReleaseContext(context);
 

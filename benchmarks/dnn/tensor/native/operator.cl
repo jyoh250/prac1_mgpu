@@ -54,56 +54,146 @@ __kernel void transpose_tensor(__global float* in, __global float* out,
   out[tid] = in[input_index_flat];
 }
 
-__kernel void rotate_tensor(__global float* in, __global float* out,
-                            __global int* in_size, __global int* out_size,
-                            __global int* in_index_buf,
-                            __global int* out_index_buf, const int dim) {
-  int tid = get_global_id(0);
+__kernel void convert_nchw_to_cnhw_large(__global float* in, __global float* out,
+                                   int size_x, int size_y, int size_z, int size_w,
+                                   int blockSize) {                             
+  // Viewing x-y matrix as a single element of w-z matrix
+  // simplifies w-z-y-x tensor to w-z matrix. 
+  // As such, we just have to make z-w matrix
+  int in_wz = get_group_id(0);     
 
-  __global int* nd_in_index = in_index_buf + tid * dim;
-  __global int* nd_out_index = out_index_buf + tid * dim;
+  int in_z = in_wz % size_z;      // z is columns of w-z matrix 
+  int in_w = in_wz / size_z;     // w is rows of w-z matrix
 
-  unflatIndex(nd_out_index, tid, out_size, dim);
+  int index = get_local_id(0);
 
-  for (int i = 0; i < dim; i++) {
-    nd_in_index[i] = nd_out_index[i];
+  int size_xy = size_x * size_y;  //size of x-y matrix
+
+  for (int i=index; i<size_xy; i+=blockSize) {
+    if (i < size_xy) {
+      int x = i % size_x;
+      int y = i / size_x;
+      float input = in[in_w*size_z*size_xy+in_z*size_xy+y*size_x+x];
+      out[in_z*size_w*size_xy+in_w*size_xy+y*size_x+x] = input;
+    }
   }
-
-  nd_in_index[dim - 1] = in_size[dim - 1] - nd_out_index[dim - 1] - 1;
-  nd_in_index[dim - 2] = in_size[dim - 2] - nd_out_index[dim - 2] - 1;
-
-  int in_index = flatIndex(nd_in_index, in_size, dim);
-
-  out[tid] = in[in_index];
 }
 
-__kernel void dilate_tensor(__global float* in, __global float* out,
-                            __global int* in_size, __global int* out_size,
-                            __global int* dilate, __global int* in_index_buf,
-                            __global int* out_index_buf, const int dim) {
-  int tid = get_global_id(0);
+__kernel void convert_nchw_to_cnhw_small(__global float* in, __global float* out,
+                                   int size_x, int size_y, int size_z, int size_w,
+                                   int numTilesZ, int numTilesW) {  
+  __local float tile[272]; // [16][17] matrix
 
-  __global int* nd_in_index = in_index_buf + tid * dim;
-  __global int* nd_out_index = out_index_buf + tid * dim;
+  // Viewing x-y matrix as a single element of w-z matrix
+  // simplifies w-z-y-x tensor to w-z matrix. 
+  // As such, we just have to make z-w matrix
+  int group_id = get_group_id(0);
+  int index = get_local_id(0);
+  int size_xy = size_x * size_y;  //size of x-y matrix
+  int offset_wz = index / size_xy;
+  int localZ = offset_wz % numTilesZ;
+  int localW = offset_wz / numTilesZ;
+  
+  int numZ = (size_z - 1) / numTilesZ + 1;
+  // z is columns of w-z matrix 
+  int globalZ = (group_id % numZ) * numTilesZ + localZ;
+  // w is rows of w-z matrix 
+  int globalW = (group_id / numZ) * numTilesW + localW;
 
-  unflatIndex(nd_out_index, tid, out_size, dim);
-
-  float out_value = 0;
-
-  if (nd_out_index[dim - 1] % dilate[1] == 0 &&
-      nd_out_index[dim - 2] % dilate[0] == 0) {
-    for (int i = 0; i < dim; i++) {
-      nd_in_index[i] = nd_out_index[i];
-    }
-
-    nd_in_index[dim - 1] /= dilate[1];
-    nd_in_index[dim - 2] /= dilate[0];
-
-    int in_index = flatIndex(nd_in_index, in_size, dim);
-    out_value = in[in_index];
+  int xy = index % size_xy;
+  int x = xy % size_x;
+  int y = xy / size_x;
+  // int offset = index / 16;
+  bool inBoundaries = globalW < size_w && globalZ < size_z && y < size_y && x < size_x;
+  if (index < numTilesZ * numTilesW * size_xy && inBoundaries) {
+    int inLocal = localW*numTilesZ*size_xy+localZ*size_xy+y*size_x+x;
+    int inGlobal = globalW*size_z*size_xy+globalZ*size_xy+y*size_x+x;
+    tile[inLocal] = in[inGlobal];
   }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  int outLocalZ = offset_wz % numTilesW;
+  int outLocalW = offset_wz / numTilesW;
+  int outGlobalW = globalZ - localZ + outLocalW;
+  int outGlobalZ = globalW - localW + outLocalZ;
+  bool outBoundaries = outGlobalW < size_z && outGlobalZ < size_w && y < size_y && x < size_x;
+  if (index < numTilesZ * numTilesW * size_xy && outBoundaries) {
+    int out_id = outGlobalW*size_w*size_xy+outGlobalZ*size_xy+y*size_x+x;
+    int out_tile_id = outLocalZ*numTilesZ*size_xy+outLocalW*size_xy+y*size_x+x;
+    out[out_id] = tile[out_tile_id];
+  }
+}
 
-  out[tid] = out_value;
+__kernel void rotate_tensor(__global float* in, __global float* out,
+                            int vol_h, int vol_w, int vol_other) { // vol_other - volume of other dims
+  const int blockSize = 256;
+  int threadIndex = get_global_id(0);
+  int stride = get_num_groups(0) * blockSize;
+
+  int vol_hw = vol_h * vol_w;
+
+  int numBlocks = (vol_hw - 1) / blockSize + 1;
+  int roundedTotalSize = vol_other * numBlocks * blockSize;
+  int roundedMatrixSize = blockSize * numBlocks;
+  for (int i = threadIndex; i < roundedTotalSize; i += stride) {
+    int hwIndex = i % roundedMatrixSize;
+    int groupIndex = i / roundedMatrixSize;
+    int inIndex = groupIndex * vol_hw + hwIndex;
+    if (hwIndex < vol_hw) {
+      int outIndex = inIndex - hwIndex + vol_hw - 1 - hwIndex;
+      out[outIndex] = in[inIndex];
+    }
+  }
+}
+
+__kernel void rotate_tensor_small(__global float* in, __global float* out,
+                            int vol_h, int vol_w, int numMatrices) { // numMatrices instead of vol_other
+  const int blockSize = 256;
+  __local float tile[blockSize];
+
+  int vol_hw = vol_h * vol_w;
+  int tileIndex = get_group_id(0);
+  int localIndex = get_local_id(0);
+
+  int inIndex = tileIndex * numMatrices * vol_hw + localIndex;
+  bool cond = localIndex < numMatrices * vol_hw;
+  if (cond) {
+    tile[localIndex] = in[inIndex];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (cond) {
+    int hwIndex = localIndex % vol_hw;
+    out[inIndex] = tile[localIndex - hwIndex + vol_hw - 1 - hwIndex];
+  }
+}
+
+__kernel void dilate_tensor(__global float* in, __global float* out,   
+                            int inVolH, int inVolW, int outVolH, int outVolW,
+                            int dilateX, int dilateY) {
+
+  int tid = get_global_id(0);
+  int elemIndex = tid % (outVolH * outVolW);
+  int hwMatrixIndex = tid / (outVolH * outVolW);
+  int hIndex = elemIndex / outVolW;
+  int wIndex = elemIndex % outVolW;
+  float data = 0;
+  if (hIndex % dilateY == 0 && wIndex % dilateX == 0) {
+    data = in[hwMatrixIndex*(inVolH*inVolW) + 
+              (hIndex/dilateY)*inVolW+wIndex/dilateX];
+  }
+  out[tid] = data;
+}
+
+__kernel void dilate_zero_tensor(__global float* in, __global float* out,       // assumed that out matrix is initially
+                            int inVolH, int inVolW, int outVolH, int outVolW,   // a zero matrix
+                            int dilateX, int dilateY) {
+  int tid = get_global_id(0);
+  float data = in[tid];
+
+  int hwMatrixIndex = tid / (inVolH * inVolW);
+  int elemIndex = tid % (inVolH * inVolW);
+  int xIndex = elemIndex % inVolW;
+  int yIndex = elemIndex / inVolW;
+  out[hwMatrixIndex*(outVolH*outVolW)+yIndex*dilateY*outVolW+xIndex*dilateX] = data;
 }
 
 __kernel void softmax_exp(__global float* input, __global float* output,
@@ -166,6 +256,30 @@ __kernel void sum_one_axis(__global float* in, __global float* out,
   }
 
   out[global_id] = sum;
+}
+
+__kernel void sum_nhw_in_cnhw(__global float* in, __global float* out,
+                           int dim1, int dim2, int dim3) {
+  const int blockSize = 128;
+  int globalC = get_group_id(0);
+  int index = get_local_id(0);
+  int totalSize = dim1 * dim2 * dim3;
+  float data = 0;
+  int offset = globalC * totalSize;
+  for (int i=index; i<totalSize; i+=blockSize) {
+    data += in[offset + i];
+  }               
+  __local float sum[blockSize];
+  sum[index] = data;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 64) { sum[index] += sum[index+64]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 32) { sum[index] += sum[index+32]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 16) { sum[index] += sum[index+16]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 8) { sum[index] += sum[index+8]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 4) { sum[index] += sum[index+4]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index < 2) { sum[index] += sum[index+2]; } barrier(CLK_LOCAL_MEM_FENCE);
+  if (index == 0)
+    out[globalC] = sum[index] + sum[index+1];
 }
 
 __kernel void scaleAdd(__global float* out, __global float* in1,

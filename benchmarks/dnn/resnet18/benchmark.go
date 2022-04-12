@@ -1,21 +1,20 @@
-// Package minerva implements minerva network training.
-package minerva
+// Package resnet18 implements ResNet-18 network training.
+package resnet18
 
 import (
 	"math"
 
-	"gitlab.com/akita/mgpusim/v2/benchmarks/dnn/tensor"
-	"gitlab.com/akita/mgpusim/v2/benchmarks/mccl"
-
-	"gitlab.com/akita/dnn/dataset/mnist"
+	"gitlab.com/akita/dnn/dataset/imagenet"
 	"gitlab.com/akita/dnn/layers"
 	"gitlab.com/akita/dnn/training"
 	"gitlab.com/akita/dnn/training/optimization"
 	"gitlab.com/akita/mgpusim/v2/benchmarks/dnn/gputraining"
+	"gitlab.com/akita/mgpusim/v2/benchmarks/dnn/tensor"
+	"gitlab.com/akita/mgpusim/v2/benchmarks/mccl"
 	"gitlab.com/akita/mgpusim/v2/driver"
 )
 
-// Benchmark defines the Mineva network training benchmark.
+// Benchmark defines the VGG16 network training benchmark.
 type Benchmark struct {
 	driver   *driver.Driver
 	ctx      *driver.Context
@@ -57,6 +56,7 @@ func (b *Benchmark) init() {
 	b.randomizeParams()
 }
 
+//nolint:gocyclo,funlen
 func (b *Benchmark) defineNetwork(gpuID int) {
 	context := b.driver.InitWithExistingPID(b.ctx)
 	b.driver.SelectGPU(context, gpuID)
@@ -68,21 +68,54 @@ func (b *Benchmark) defineNetwork(gpuID int) {
 
 	network := training.Network{
 		Layers: []layers.Layer{
-			layers.NewFullyConnectedLayer(
-				0, to, 784, 256,
-			),
+			// Conv 1
+			layers.NewConv2D(0, to, []int{3, 224, 224}, []int{64, 3, 8, 8}, []int{2, 2}, []int{3, 3}), // orig 7x7 kernel
 			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(
-				1, to, 256, 100,
-			),
+			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}), // orig 3x3 kernel, 1x1 padding
+			// Conv2 - 1
+			layers.NewConv2D(3, to, []int{64, 56, 56}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
 			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(
-				1, to, 100, 100,
-			),
+			layers.NewConv2D(5, to, []int{64, 56, 56}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
 			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(
-				1, to, 100, 10,
-			),
+			// Conv2 - 2
+			layers.NewConv2D(7, to, []int{64, 56, 56}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{64, 56, 56}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv3 - 1
+			layers.NewConv2D(1, to, []int{64, 56, 56}, []int{128, 64, 4, 4}, []int{2, 2}, []int{1, 1}), // orig 3x3 kernel
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{128, 28, 28}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv3 - 2
+			layers.NewConv2D(1, to, []int{128, 28, 28}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{128, 28, 28}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv4 - 1
+			layers.NewConv2D(1, to, []int{128, 28, 28}, []int{256, 128, 4, 4}, []int{2, 2}, []int{1, 1}), // orig 3x3 kernel
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{256, 14, 14}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv4 - 2
+			layers.NewConv2D(1, to, []int{256, 14, 14}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{256, 14, 14}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv5 - 1
+			layers.NewConv2D(1, to, []int{256, 14, 14}, []int{512, 256, 4, 4}, []int{2, 2}, []int{1, 1}), // orig 3x3 kernel
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{512, 7, 7}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			// Conv5 - 2
+			layers.NewConv2D(1, to, []int{512, 7, 7}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+			layers.NewConv2D(1, to, []int{512, 7, 7}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+			layers.NewReluLayer(to),
+
+			layers.NewAvgPoolingLayer(to, []int{7, 7}, []int{0, 0}, []int{1, 1}),
+
+			layers.NewFullyConnectedLayer(1, to, 512, 1000),
 		},
 	}
 
@@ -98,13 +131,13 @@ func (b *Benchmark) createTrainer() {
 	lossFuncs := make([]training.LossFunction, len(b.networks))
 
 	for i := 0; i < len(b.networks); i++ {
-		sources[i] = mnist.NewTrainingDataSource(b.to[i])
+		sources[i] = imagenet.NewTrainingDataSource(b.to[i])
 		alg[i] = optimization.NewAdam(b.to[i], 0.001)
 		lossFuncs[i] = training.NewSoftmaxCrossEntropy(b.to[i])
 
 		if b.EnableTesting {
 			testers[i] = &training.Tester{
-				DataSource: mnist.NewTestDataSource(b.to[i]),
+				DataSource: imagenet.NewTestDataSource(b.to[i]),
 				Network:    b.networks[i],
 				BatchSize:  math.MaxInt32,
 			}

@@ -4,6 +4,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"gitlab.com/akita/mgpusim/v2/insts"
+	"gitlab.com/akita/mgpusim/v2/kernels"
 	"gitlab.com/akita/mgpusim/v2/timing/wavefront"
 )
 
@@ -41,9 +42,9 @@ var _ = Describe("Branch Unit", func() {
 	})
 
 	It("should run", func() {
-		wave1 := new(wavefront.Wavefront)
-		wave2 := new(wavefront.Wavefront)
-		wave3 := new(wavefront.Wavefront)
+		wave1 := wavefront.NewWavefront(kernels.NewWavefront())
+		wave2 := wavefront.NewWavefront(kernels.NewWavefront())
+		wave3 := wavefront.NewWavefront(kernels.NewWavefront())
 		wave3.State = wavefront.WfRunning
 		wave3.InstBuffer = make([]byte, 256)
 		wave3.InstBufferStartPC = 0x100
@@ -70,7 +71,7 @@ var _ = Describe("Branch Unit", func() {
 		Expect(sp.wfPrepared).To(BeIdenticalTo(wave1))
 		Expect(alu.wfExecuted).To(BeIdenticalTo(wave2))
 		Expect(sp.wfCommitted).To(BeIdenticalTo(wave3))
-		Expect(wave3.InstBuffer).To(HaveLen(0))
+		Expect(wave2.InstBuffer).To(HaveLen(0))
 	})
 
 	It("should flush", func() {

@@ -178,7 +178,7 @@ func (i Inst) vop2String() string {
 	s += fmt.Sprintf(", %s, %s", i.Src0.String(), i.Src1.String())
 
 	switch i.Opcode {
-	case 0, 28, 29:
+	case 0, 28, 29, 30:
 		s += ", vcc"
 	case 24, 37: // madak
 		s += ", " + i.Src2.String()

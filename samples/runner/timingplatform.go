@@ -27,6 +27,7 @@ type R9NanoPlatformBuilder struct {
 	traceMem           bool
 	numGPU             int
 	useMagicMemoryCopy bool
+	useProjection      bool
 	log2PageSize       uint64
 
 	monitor *monitoring.Monitor
@@ -62,6 +63,12 @@ func (b R9NanoPlatformBuilder) WithISADebugging() R9NanoPlatformBuilder {
 // WithVisTracing lets the platform to record traces for visualization purposes.
 func (b R9NanoPlatformBuilder) WithVisTracing() R9NanoPlatformBuilder {
 	b.traceVis = true
+	return b
+}
+
+// WithProjection allows the GPUs to project parts of the execution.
+func (b R9NanoPlatformBuilder) WithProjection() R9NanoPlatformBuilder {
+	b.useProjection = true
 	return b
 }
 
@@ -271,6 +278,10 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithLog2MemoryBankInterleavingSize(7).
 		WithLog2PageSize(b.log2PageSize).
 		WithGlobalStorage(b.globalStorage)
+
+	if b.useProjection {
+		gpuBuilder = gpuBuilder.WithProjection()
+	}
 
 	if b.monitor != nil {
 		gpuBuilder = gpuBuilder.WithMonitor(b.monitor)

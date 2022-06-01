@@ -139,6 +139,7 @@ func (d *DispatcherImpl) processMessagesFromCU(now sim.VTimeInSec) bool {
 		tracing.TraceReqFinalize(originalReq, now, d)
 
 		if d.progressBar != nil {
+			// fmt.Printf("wg complete, %.10f\n", now)
 			d.progressBar.MoveInProgressToFinished(1)
 		}
 

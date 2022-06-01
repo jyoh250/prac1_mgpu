@@ -40,6 +40,7 @@ type R9NanoGPUBuilder struct {
 	enableISADebugging bool
 	enableMemTracing   bool
 	enableVisTracing   bool
+	useProjection      bool
 	visTracer          tracing.Tracer
 	memTracer          tracing.Tracer
 	monitor            *monitoring.Monitor
@@ -212,6 +213,12 @@ func (b R9NanoGPUBuilder) WithGlobalStorage(
 	storage *mem.Storage,
 ) R9NanoGPUBuilder {
 	b.globalStorage = storage
+	return b
+}
+
+// WithProjection allows the GPU to execute in projection mode.
+func (b R9NanoGPUBuilder) WithProjection() R9NanoGPUBuilder {
+	b.useProjection = true
 	return b
 }
 
@@ -755,6 +762,10 @@ func (b *R9NanoGPUBuilder) buildCP() {
 		WithEngine(b.engine).
 		WithFreq(b.freq).
 		WithMonitor(b.monitor)
+
+	if b.useProjection {
+		builder = builder.WithProjection()
+	}
 
 	if b.enableVisTracing {
 		builder = builder.WithVisTracer(b.visTracer)

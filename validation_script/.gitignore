@@ -1,0 +1,5 @@
+*.stderr
+*.stdout
+*.tmp
+validation_script
+results

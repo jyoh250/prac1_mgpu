@@ -11,7 +11,9 @@ import (
 
 // A Builder can build dispatchers
 type Builder struct {
+	engine          sim.Engine
 	cp              tracing.NamedHookable
+	projectionMode  bool
 	cuResourcePool  resource.CUResourcePool
 	alg             string
 	respondingPort  sim.Port
@@ -19,17 +21,32 @@ type Builder struct {
 	monitor         *monitoring.Monitor
 }
 
-// MakeBuilder creates a builder with default dispatching configureations.
+// MakeBuilder creates a builder with default dispatching configurations.
 func MakeBuilder() Builder {
 	b := Builder{
-		alg: "partition",
+		alg:            "partition",
+		projectionMode: false,
 	}
+	return b
+}
+
+// WithEngine sets the engine that the dispatcher can use.
+// It only matters if the projection node is enabled.
+func (b Builder) WithEngine(e sim.Engine) Builder {
+	b.engine = e
 	return b
 }
 
 // WithCP sets the Command Processor that the Dispatcher belongs to.
 func (b Builder) WithCP(cp tracing.NamedHookable) Builder {
 	b.cp = cp
+	return b
+}
+
+// WithProjectionMode allows the dispatcher to project execution time of the
+// WGs rather than simulating them.
+func (b Builder) WithProjectionMode() Builder {
+	b.projectionMode = true
 	return b
 }
 
@@ -73,6 +90,59 @@ func (b Builder) WithMonitor(monitor *monitoring.Monitor) Builder {
 
 // Build creates a dispatcher.
 func (b Builder) Build(name string) Dispatcher {
+	if b.projectionMode {
+		return b.buildProjectionDispatcher(name)
+	}
+
+	return b.buildDefaultDispatcher(name)
+}
+
+func (b Builder) buildProjectionDispatcher(name string) Dispatcher {
+	d := &wgProjectionDispatcher{
+		engine:          b.engine,
+		name:            name,
+		cp:              b.cp,
+		respondingPort:  b.respondingPort,
+		dispatchingPort: b.dispatchingPort,
+		inflightWGs:     make(map[string]dispatchLocation),
+		originalReqs:    make(map[string]*protocol.MapWGReq),
+		latencyTable: []int{
+			1,
+			4, 4, 4, 4,
+			5, 6, 7, 8,
+			9, 10, 11, 12,
+			13, 14, 15, 16,
+		},
+		constantKernelOverhead:  1600,
+		monitor:                 b.monitor,
+		projectionDecisionMaker: newWindowedProjectionDecisionMaker(),
+	}
+
+	switch b.alg {
+	case "round-robin":
+		d.alg = &roundRobinAlgorithm{
+			gridBuilder: kernels.NewGridBuilder(),
+			cuPool:      b.cuResourcePool,
+		}
+	case "greedy":
+		d.alg = &greedyAlgorithm{
+			gridBuilder: kernels.NewGridBuilder(),
+			cuPool:      b.cuResourcePool,
+		}
+	case "partition":
+		d.alg = &partitionAlgorithm{
+			cuPool: b.cuResourcePool,
+		}
+	default:
+		panic("unknown dispatching algorithm " + b.alg)
+	}
+
+	d.projectionDecisionMaker = newWindowedProjectionDecisionMaker()
+
+	return d
+}
+
+func (b Builder) buildDefaultDispatcher(name string) Dispatcher {
 	d := &DispatcherImpl{
 		name:            name,
 		cp:              b.cp,

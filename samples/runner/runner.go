@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 
 	// Enable profiling
 	_ "net/http/pprof"
@@ -63,6 +64,8 @@ var filenameFlag = flag.String("metric-file-name", "metrics",
 	"Modify the name of the output csv file.")
 var magicMemoryCopy = flag.Bool("magic-memory-copy", false,
 	"Copy data from CPU directly to global memory")
+var allowProjectionFlag = flag.Bool("allow-projection", false,
+	"Allow skipping some of the work-group execution to reduce simulation time.")
 
 type verificationPreEnablingBenchmark interface {
 	benchmarks.Benchmark
@@ -192,7 +195,7 @@ func (r *Runner) startProfilingServer() {
 		panic(err)
 	}
 
-	fmt.Println("Profiling server running on:",
+	fmt.Fprintln(os.Stderr, "Profiling server running on:",
 		listener.Addr().(*net.TCPAddr).Port)
 
 	panic(http.Serve(listener, nil))
@@ -267,6 +270,10 @@ func (r *Runner) buildTimingPlatform() {
 
 	if r.Parallel {
 		b = b.WithParallelEngine()
+	}
+
+	if *allowProjectionFlag {
+		b = b.WithProjection()
 	}
 
 	if *isaDebug {

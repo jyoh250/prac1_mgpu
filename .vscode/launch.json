@@ -149,10 +149,9 @@
             "program": "${workspaceFolder}/samples/fir",
             "args": [
                 "-timing",
-                "-verify",
-                "-length=128000",
-                "-report-all",
-                "-max-inst=100"
+                "-length=6400000",
+                "-allow-projection",
+                "-magic-memory-copy"
             ]
         },
         {
@@ -427,8 +426,10 @@
             "mode": "debug",
             "program": "${workspaceFolder}/samples/minerva",
             "args": [
-                // "-timing",
-                "-mnist-data-folder=/home/yifan/dev/src/gitlab.com/akita/dnn/dataset/mnist/data/"
+                "-timing",
+                "-mnist-data-folder=/Users/yifan/dev/src/gitlab.com/akita/dnn/dataset/mnist/data",
+                "-batch-size=1",
+                "--allow-projection"
             ]
         },
         {
@@ -476,6 +477,19 @@
             "mode": "debug",
             "program": "${workspaceFolder}/samples/server",
             "args": []
+        },
+        {
+            "name": "Validation Script",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/validation_script",
+            "args": [
+                "-timing",
+                "-benchmark=relu",
+                "-magic-memory-copy",
+                "-allow-projection"
+            ]
         }
     ]
 }

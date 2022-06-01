@@ -20,6 +20,7 @@ type Builder struct {
 	engine         sim.Engine
 	visTracer      tracing.Tracer
 	monitor        *monitoring.Monitor
+	useProjection  bool
 	numDispatchers int
 }
 
@@ -32,7 +33,7 @@ func MakeBuilder() Builder {
 	return b
 }
 
-// WithVisTracer enables tracing for visualzation on the command processor and
+// WithVisTracer enables tracing for visualization on the command processor and
 // the dispatchers.
 func (b Builder) WithVisTracer(tracer tracing.Tracer) Builder {
 	b.visTracer = tracer
@@ -54,6 +55,13 @@ func (b Builder) WithFreq(freq sim.Freq) Builder {
 // WithMonitor sets the monitor used to show progress bars.
 func (b Builder) WithMonitor(monitor *monitoring.Monitor) Builder {
 	b.monitor = monitor
+	return b
+}
+
+// WithProjection allows the dispatchers to project part of the kernel
+// execution.
+func (b Builder) WithProjection() Builder {
+	b.useProjection = true
 	return b
 }
 
@@ -108,11 +116,16 @@ func (b Builder) Build(name string) *CommandProcessor {
 func (b *Builder) buildDispatchers(cp *CommandProcessor) {
 	cuResourcePool := resource.NewCUResourcePool()
 	builder := dispatching.MakeBuilder().
+		WithEngine(b.engine).
 		WithCP(cp).
 		WithCUResourcePool(cuResourcePool).
 		WithDispatchingPort(cp.ToCUs).
 		WithRespondingPort(cp.ToDriver).
 		WithMonitor(b.monitor)
+
+	if b.useProjection {
+		builder = builder.WithProjectionMode()
+	}
 
 	for i := 0; i < b.numDispatchers; i++ {
 		disp := builder.Build(fmt.Sprintf("%s.Dispatcher%d", cp.Name(), i))
